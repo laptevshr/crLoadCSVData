@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb_ohlcvt
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: financial_data
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - financial_network
+
+  data-loader:
+    build: .
+    container_name: data_loader
+    depends_on:
+      - mongodb
+    volumes:
+      - ./data:/app/data
+      - .:/app
+    working_dir: /app
+    networks:
+      - financial_network
+    command: >
+      sh -c "sleep 10 &&
+             python csv_to_mongodb.py --csv-dir /app/data 
+             --mongo-uri mongodb://admin:password@mongodb:27017/financial_data?authSource=admin
+             --db-name financial_data --collection ohlcvt_data"
+
+volumes:
+  mongodb_data:
+
+networks:
+  financial_network:
+    driver: bridge
