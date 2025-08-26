@@ -4,7 +4,7 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, BulkWriteError
 import logging
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import argparse
 
 # Настройка логирования
@@ -80,20 +80,16 @@ class CSVToMongoDBLoader:
             # Чтение каждого CSV файла
             for csv_file in csv_files:
                 try:
-                    # Чтение CSV с указанием заголовков и преобразованием дат
+                    # Чтение CSV с указанием нужных столбцов (без немедленного парсинга дат, чтобы обработать целые числа)
                     df = pd.read_csv(
                         csv_file,
-                        parse_dates=['Open time', 'Close time'],
-                        infer_datetime_format=True
+                        usecols=['Open time', 'Open', 'Close', 'High', 'Low', 'Volume']
                     )
-                    
                     # Добавляем поле с названием файла
                     df['source_file'] = os.path.basename(csv_file)
                     df['import_timestamp'] = datetime.now()
-                    
                     dataframes.append(df)
                     logger.info(f"Прочитан файл: {os.path.basename(csv_file)} - {len(df)} строк")
-                    
                 except Exception as e:
                     logger.error(f"Ошибка чтения файла {csv_file}: {e}")
                     
@@ -112,15 +108,33 @@ class CSVToMongoDBLoader:
         Returns:
             Список словарей для вставки в MongoDB
         """
+        # Нормализация столбца времени: если целое число (секунды / миллисекунды) -> конвертируем
+        if 'Open time' in df.columns:
+            # Попытка определить типы
+            if pd.api.types.is_integer_dtype(df['Open time']) or pd.api.types.is_float_dtype(df['Open time']):
+                # Целые / числа — преобразуем через helper
+                df['Open time'] = df['Open time'].apply(self._convert_epoch_to_iso)
+            else:
+                # Пытаемся распарсить строки/даты и привести к ISO
+                def _parse_any(v):
+                    if pd.isna(v):
+                        return None
+                    if isinstance(v, (int, float)):
+                        return self._convert_epoch_to_iso(v)
+                    try:
+                        ts = pd.to_datetime(v, utc=True, errors='raise')
+                        return ts.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + '+00:00'
+                    except Exception:
+                        return None
+                df['Open time'] = df['Open time'].apply(_parse_any)
+
         # Преобразование DataFrame в список словарей
         records = df.to_dict('records')
         
         # Преобразование типов данных и переименование полей
         for record in records:
             # Преобразование числовых полей
-            numeric_fields = ['Open', 'High', 'Low', 'Close', 'Volume', 'Quote asset volume', 
-                             'Number of trades', 'Taker buy base asset volume', 
-                             'Taker buy quote asset volume', 'Ignore']
+            numeric_fields = ['Open', 'High', 'Low', 'Close', 'Volume']
             
             for field in numeric_fields:
                 if field in record and pd.notna(record[field]):
@@ -137,6 +151,29 @@ class CSVToMongoDBLoader:
                     record['Number of trades'] = None
         
         return records
+
+    @staticmethod
+    def _convert_epoch_to_iso(value) -> Optional[str]:
+        """Конвертация числовой метки времени (секунды или миллисекунды) в ISO 8601 строку UTC.
+        Возвращает None при невозможности конвертации.
+        """
+        if pd.isna(value):
+            return None
+        try:
+            # Приводим к int
+            iv = int(value)
+            # Определяем: миллисекунды или секунды
+            # Если значение больше 10**12 (примерно после 2001-09-09 для ms) -> вероятно мс
+            if iv > 10**12:
+                dt = datetime.fromtimestamp(iv / 1000, tz=timezone.utc)
+            elif iv > 10**9:  # секунды ( > ~2001 года )
+                dt = datetime.fromtimestamp(iv, tz=timezone.utc)
+            else:
+                # Возможно в секундах до 2001 года, все равно интерпретируем как секунды
+                dt = datetime.fromtimestamp(iv, tz=timezone.utc)
+            return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + '+00:00'
+        except Exception:
+            return None
     
     def create_indexes(self):
         """Создание индексов для оптимизации запросов"""
